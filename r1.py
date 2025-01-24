@@ -5,9 +5,9 @@ import sys
 import json
 from pathlib import Path
 from textwrap import dedent
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 from openai import OpenAI
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from rich.console import Console
 from rich.table import Table
@@ -46,9 +46,12 @@ class FileToEdit(BaseModel):
     new_snippet: str
 
 class AssistantResponse(BaseModel):
-    assistant_reply: str
+    assistant_reply: Optional[str] = None
     files_to_create: Optional[List[FileToCreate]] = None
     files_to_edit: Optional[List[FileToEdit]] = None
+    analysis: Optional[str] = None
+    explanation: Optional[str] = None
+    output: Optional[str] = Field(None, pattern=r'^(CORRECT|INCORRECT|UNECESSARY|NEED_CHANGES)$')
 
 # --------------------------------------------------------------------------------
 # 3. system prompts
@@ -79,6 +82,72 @@ planning_system_PROMPT = dedent("""\
     - NEVER include other fields like files_to_create/edit
     - Escape all double quotes in text content
     - Example valid response: {"assistant_reply": "1. First step\n2. Second step"}
+""")
+
+review_system_PROMPT = dedent("""\
+    You are an elite software engineer tasked with reviewing code changes.
+    Your job is to analyze proposed code changes and determine if they correctly and completely solve the problem while adhering to all guidelines.
+
+    Input format:
+    {
+        "total_new_files": 0,
+        "total_edits": N,  // Number of distinct edits
+        "changes": [
+            {
+            "change_type": "file_edit",
+            "path": "path/to/file",
+            "original": "exact code snippet that will be replaced",
+            "new": "new code snippet that will replace the original"
+            },
+            // ... additional changes
+        ]
+    }
+                              
+    This format allows the review function to make accurate determinations about whether the changes should be marked as CORRECT, INCORRECT, UNNECESSARY, or NEED_CHANGES based on a clear view of exactly what is being modified.
+
+    Review Requirements:
+    1. State which change you are reviewing from previous system input.
+    2. Analyze each of the diffs provided in 'changes'
+    3. Evaluate them based on the review criteria
+    4. Provide a detailed analysis of the changes
+    5. Explain why the changes are either CORRECT, INCORRECT, UNECESSARY, or NEED_CHANGES
+                              
+
+    Output Format:
+    Respond STRICTLY in this JSON format:
+    {
+      "analysis": "Detailed analysis of the overall code changes",
+      "explanation": "Brief justification for the output status",
+      "output": "One of [CORRECT, INCORRECT, UNECESSARY, NEED_CHANGES]"
+    }
+    
+
+    Review Criteria:
+    1. COMPLETENESS: Do the changes fully address the problem requirements?
+    2. CORRECTNESS: Does the code follow technical specifications and avoid errors?
+    3. FOCUS: Are changes limited to the problem scope without unnecessary expansions?
+    4. QUALITY: Does the code follow best practices and maintain existing standards?
+    5. SAFETY: Are all security checks and validations in place?
+
+    Analysis Guidelines:
+    - Check for type errors, syntax errors, and security vulnerabilities
+    - The goal is to evaluate the changes provided
+    - You must first acknowledge what the changes are before providing a review
+    - Ensure no existing functionality is broken
+    - Confirm changes don't include unrelated modifications
+    - Validate proper error handling and edge case coverage
+
+    Output Status Definitions:
+    - CORRECT: Changes perfectly solve the problem with no issues
+    - INCORRECT: Changes contain too many errors to be fixed or does not address the problem
+    - UNECESSARY: Changes include scope creep or unrelated modifications
+    - NEED_CHANGES: Partially correct but requires specific adjustments
+
+    Critical Instructions:
+    - output MUST be exactly one of the allowed statuses
+    - analysis MUST be a single paragraph
+    - explanation MUST be 1-2 sentences
+    - Escape all double quotes in text content
 """)
 
 system_PROMPT = dedent("""\
@@ -242,7 +311,7 @@ def apply_diff_edit(path: str, original_snippet: str, new_snippet: str):
         console.print(f"[yellow]⚠[/yellow] {str(e)} in '[cyan]{path}[/cyan]'. No changes made.", style="yellow")
         console.print("\nExpected snippet:", style="yellow")
         console.print(Panel(original_snippet, title="Expected", border_style="yellow"))
-        console.print("\nActual file content:", style="yellow")
+        # console.print("\nActual file content:", style="yellow")
         console.print(Panel(content, title="Actual", border_style="yellow"))
 
 def try_handle_add_command(user_input: str) -> bool:
@@ -267,111 +336,84 @@ def try_handle_add_command(user_input: str) -> bool:
         return True
     return False
 
-def add_directory_to_conversation(directory_path: str):
+def get_file_content_from_history(file_path: str, conversation_history: List[Dict[str, str]]) -> Optional[str]:
+    """
+    Retrieve file content from conversation history by path.
+    
+    Args:
+        file_path: The normalized path of the file to find
+        conversation_history: The list of conversation messages
+        
+    Returns:
+        The file content if found, None otherwise
+    """
+    normalized_path = normalize_path(file_path)
+    file_marker = f"Content of file '{normalized_path}'"
+    
+    for msg in conversation_history:
+        if msg["role"] == "system" and file_marker in msg["content"]:
+            # Extract content after the marker
+            content = msg["content"].split(file_marker + ":\n\n", 1)
+            if len(content) > 1:
+                return content[1]
+    return None
+
+def add_directory_to_conversation(directory_path: str) -> Tuple[List[str], List[str]]:
+    """
+    Add all suitable files from a directory to conversation history.
+    
+    Args:
+        directory_path: Path to the directory to process
+        
+    Returns:
+        Tuple of (added_files, skipped_files) lists
+    """
+    added_files = []
+    skipped_files = []
+    
     with console.status("[bold green]Scanning directory...") as status:
         excluded_files = {
-            # Python specific
-            ".DS_Store", "Thumbs.db", ".gitignore", ".python-version",
-            "uv.lock", ".uv", "uvenv", ".uvenv", ".venv", "venv",
-            "__pycache__", ".pytest_cache", ".coverage", ".mypy_cache",
-            # Node.js / Web specific
-            "node_modules", "package-lock.json", "yarn.lock", "pnpm-lock.yaml",
-            ".next", ".nuxt", "dist", "build", ".cache", ".parcel-cache",
-            ".turbo", ".vercel", ".output", ".contentlayer",
-            # Build outputs
-            "out", "coverage", ".nyc_output", "storybook-static",
-            # Environment and config
-            ".env", ".env.local", ".env.development", ".env.production",
-            # Misc
-            ".git", ".svn", ".hg", "CVS"
+            ".git", "__pycache__", "node_modules",
+            ".env", ".venv", "venv",
+            ".DS_Store", "Thumbs.db"
         }
         excluded_extensions = {
-            # Binary and media files
-            ".png", ".jpg", ".jpeg", ".gif", ".ico", ".svg", ".webp", ".avif",
-            ".mp4", ".webm", ".mov", ".mp3", ".wav", ".ogg",
-            ".zip", ".tar", ".gz", ".7z", ".rar",
-            ".exe", ".dll", ".so", ".dylib", ".bin",
-            # Documents
-            ".pdf", ".doc", ".docx", ".xls", ".xlsx", ".ppt", ".pptx",
-            # Python specific
-            ".pyc", ".pyo", ".pyd", ".egg", ".whl",
-            # UV specific
-            ".uv", ".uvenv",
-            # Database and logs
-            ".db", ".sqlite", ".sqlite3", ".log",
-            # IDE specific
-            ".idea", ".vscode",
-            # Web specific
-            ".map", ".chunk.js", ".chunk.css",
-            ".min.js", ".min.css", ".bundle.js", ".bundle.css",
-            # Cache and temp files
-            ".cache", ".tmp", ".temp",
-            # Font files
-            ".ttf", ".otf", ".woff", ".woff2", ".eot"
+            ".pyc", ".pyo", ".pyd",
+            ".exe", ".dll", ".so",
+            ".zip", ".tar", ".gz",
+            ".jpg", ".png", ".pdf"
         }
-        skipped_files = []
-        added_files = []
-        total_files_processed = 0
-        max_files = 1000  # Reasonable limit for files to process
-        max_file_size = 5_000_000  # 5MB limit
-
+        
         for root, dirs, files in os.walk(directory_path):
-            if total_files_processed >= max_files:
-                console.print(f"[yellow]⚠[/yellow] Reached maximum file limit ({max_files})")
-                break
-
-            status.update(f"[bold green]Scanning {root}...")
-            # Skip hidden directories and excluded directories
+            # Skip excluded directories
             dirs[:] = [d for d in dirs if not d.startswith('.') and d not in excluded_files]
-
+            
             for file in files:
-                if total_files_processed >= max_files:
-                    break
-
-                if file.startswith('.') or file in excluded_files:
+                if any((
+                    file.startswith('.'),
+                    file in excluded_files,
+                    Path(file).suffix.lower() in excluded_extensions
+                )):
                     skipped_files.append(os.path.join(root, file))
                     continue
-
-                _, ext = os.path.splitext(file)
-                if ext.lower() in excluded_extensions:
-                    skipped_files.append(os.path.join(root, file))
-                    continue
-
-                full_path = os.path.join(root, file)
-
+                    
                 try:
-                    # Check file size before processing
-                    if os.path.getsize(full_path) > max_file_size:
-                        skipped_files.append(f"{full_path} (exceeds size limit)")
+                    full_path = os.path.join(root, file)
+                    if os.path.getsize(full_path) > 5_000_000:  # 5MB limit
+                        skipped_files.append(f"{full_path} (size limit exceeded)")
                         continue
-
-                    # Check if it's binary
+                        
                     if is_binary_file(full_path):
-                        skipped_files.append(full_path)
+                        skipped_files.append(f"{full_path} (binary file)")
                         continue
-
-                    normalized_path = normalize_path(full_path)
-                    content = read_local_file(normalized_path)
-                    conversation_history.append({
-                        "role": "system",
-                        "content": f"Content of file '{normalized_path}':\n\n{content}"
-                    })
-                    added_files.append(normalized_path)
-                    total_files_processed += 1
-
-                except OSError:
-                    skipped_files.append(full_path)
-
-        console.print(f"[green]✓[/green] Added folder '[cyan]{directory_path}[/cyan]' to conversation.")
-        if added_files:
-            console.print(f"\n[bold]Added files:[/bold] ({len(added_files)} of {total_files_processed})")
-            for f in added_files:
-                console.print(f"[cyan]{f}[/cyan]")
-        if skipped_files:
-            console.print(f"\n[yellow]Skipped files:[/yellow] ({len(skipped_files)})")
-            for f in skipped_files:
-                console.print(f"[yellow]{f}[/yellow]")
-        console.print()
+                        
+                    if ensure_file_in_context(full_path):
+                        added_files.append(full_path)
+                        
+                except OSError as e:
+                    skipped_files.append(f"{full_path} ({str(e)})")
+                    
+        return added_files, skipped_files
 
 def is_binary_file(file_path: str, peek_size: int = 1024) -> bool:
     try:
@@ -386,18 +428,34 @@ def is_binary_file(file_path: str, peek_size: int = 1024) -> bool:
         return True
 
 def ensure_file_in_context(file_path: str) -> bool:
+    """
+    Ensures a file's content is available in conversation history.
+    
+    Args:
+        file_path: Path to the file to check/add
+        
+    Returns:
+        True if file is in context (either already there or successfully added),
+        False if file couldn't be read
+    """
     try:
         normalized_path = normalize_path(file_path)
+        
+        # First check if already in history
+        existing_content = get_file_content_from_history(normalized_path, conversation_history)
+        if existing_content is not None:
+            return True
+            
+        # If not found, try to read and add
         content = read_local_file(normalized_path)
-        file_marker = f"Content of file '{normalized_path}'"
-        if not any(file_marker in msg["content"] for msg in conversation_history):
-            conversation_history.append({
-                "role": "system",
-                "content": f"{file_marker}:\n\n{content}"
-            })
+        conversation_history.append({
+            "role": "system",
+            "content": f"Content of file '{normalized_path}':\n\n{content}"
+        })
         return True
-    except OSError:
-        console.print(f"[red]✗[/red] Could not read file '[cyan]{file_path}[/cyan]' for editing context", style="red")
+        
+    except OSError as e:
+        console.print(f"[red]✗[/red] Could not read file '[cyan]{file_path}[/cyan]': {str(e)}", style="red")
         return False
 
 def normalize_path(path_str: str) -> str:
@@ -433,6 +491,178 @@ def guess_files_in_message(user_message: str) -> List[str]:
             except (OSError, ValueError):
                 continue
     return potential_paths
+
+def validate_edits(response_data: AssistantResponse, conversation_history: List[Dict]) -> Optional[AssistantResponse]:
+    """Check if all edits can be applied safely (original_snippet exists exactly once)."""
+    issues = []
+    if response_data.files_to_edit:
+        for edit in response_data.files_to_edit:
+            content = get_file_content_from_history(edit.path, conversation_history)
+            if content is None:
+                issues.append(f"File '{edit.path}' not found in context.")
+                continue
+            count = content.count(edit.original_snippet)
+            if count == 0:
+                issues.append(f"Original snippet not found in '{edit.path}'.")
+            elif count > 1:
+                issues.append(f"Multiple occurrences ({count}) of snippet in '{edit.path}'.")
+    
+    if issues:
+        analysis = "Invalid edits detected:\n- " + "\n- ".join(issues)
+        explanation = "Edits cannot be applied due to missing or ambiguous snippets."
+        return AssistantResponse(
+            analysis=analysis,
+            explanation=explanation,
+            output="NEED_CHANGES"
+        )
+    return None
+
+def generate_review(response_data: AssistantResponse) -> AssistantResponse:
+    """Generate code review by analyzing the proposed changes without modifying conversation history.
+    
+    Args:
+        response_data: AssistantResponse object containing proposed changes
+        
+    Returns:
+        AssistantResponse object containing review results
+    """
+    console.print("\n[bold yellow]Starting Review Phase[/bold yellow]")
+    
+    # Perform automated validation of edits
+    validation_result = validate_edits(response_data, conversation_history)
+    if validation_result:
+        console.print("[yellow]Automated validation failed, returning NEED_CHANGES[/yellow]")
+        return validation_result
+    
+    try:
+        # Build review context
+        review_context = []
+        file_contexts = []
+        
+        # Process file contents from conversation history
+        for msg in conversation_history:
+            if msg["role"] == "system" and "Content of file '" in msg["content"]:
+                file_contexts.append(msg["content"])
+                
+        # Process implementation plan if it exists
+        plan_context = []
+        for msg in conversation_history:
+            if msg["role"] == "system" and '"Plan Summary"' in msg["content"]:
+                try:
+                    plan_data = json.loads(msg["content"])
+                    plan_context.append(f"Implementation Plan:\n{plan_data.get('Plan Summary', 'No plan found')}")
+                except json.JSONDecodeError:
+                    continue
+        
+        # Handle new files
+        if response_data.files_to_create:
+            for file in response_data.files_to_create:
+                review_context.append({
+                    "change_type": "new_file",
+                    "path": file.path,
+                    "content": file.content
+                })
+        
+        # Handle file edits
+        if response_data.files_to_edit:
+            for edit in response_data.files_to_edit:
+                review_context.append({
+                    "change_type": "file_edit",
+                    "path": edit.path,
+                    "original": edit.original_snippet,
+                    "new": edit.new_snippet
+                })
+        
+        # Build complete review request with all context embedded
+        review_request = {
+            "role": "user",
+            "content": dedent(f"""
+                You are an elite software engineer performing a code review. Here is the complete context and changes to review:
+
+                {review_system_PROMPT}
+
+                EXISTING FILE CONTEXT:
+                {''.join(file_contexts)}
+
+                {('IMPLEMENTATION PLAN:\n' + '\n'.join(plan_context)) if plan_context else ''}
+
+                COMPLETE CHANGES SUMMARY:
+                {json.dumps({
+                    "total_new_files": len(response_data.files_to_create) if response_data.files_to_create else 0,
+                    "total_edits": len(response_data.files_to_edit) if response_data.files_to_edit else 0,
+                    "changes": review_context
+                }, indent=2)}
+
+                Please perform a thorough code review of the proposed changes:
+                1. Verify the changes solve the intended problem completely
+                2. Check for potential bugs, edge cases, and security issues
+                3. Evaluate code quality, readability, and maintainability
+                4. Confirm all changes are necessary and focused
+                5. Validate error handling and input validation
+                
+                Provide a detailed analysis and clear recommendation following the specified JSON format.
+            """).strip()
+        }
+        
+        # Generate review using streaming
+        console.print("[cyan]Analyzing code changes...[/cyan]")
+        review_messages = [
+            {"role": "system", "content": review_system_PROMPT},
+            review_request
+        ]
+        
+        # Create a new chat completion for review
+        stream = client.chat.completions.create(
+            model="deepseek-reasoner",
+            messages=review_messages,
+            stream=True
+        )
+        
+        console.print("\nGenerating review...", style="bold yellow")
+        review_content = ""
+        
+        for chunk in stream:
+            if chunk.choices[0].delta.content:
+                content_part = chunk.choices[0].delta.content
+                review_content += content_part
+                console.print(content_part, end="")
+        
+        console.print()
+        
+        # Parse and validate review response
+        try:
+            parsed = json.loads(review_content)
+            review_result = AssistantResponse(
+                analysis=parsed.get('analysis'),
+                explanation=parsed.get('explanation'),
+                output=parsed.get('output')
+            )
+            
+            # Validate review output
+            if not review_result.output or review_result.output not in ["CORRECT", "INCORRECT", "UNECESSARY", "NEED_CHANGES"]:
+                raise ValueError(f"Invalid review status: {review_result.output}")
+            
+            console.print(f"[green]✓[/green] Review completed: {review_result.output}")
+            return review_result
+            
+        except json.JSONDecodeError as e:
+            error_msg = f"Failed to parse review response: {str(e)}"
+            console.print(f"[red]✗[/red] {error_msg}")
+            console.print(f"Problematic content: {review_content}")
+            return AssistantResponse(
+                analysis="Failed to parse review response",
+                explanation=str(e),
+                output="INCORRECT"
+            )
+            
+    except Exception as e:
+        error_msg = f"Review generation failed: {str(e)}"
+        console.print(f"[red]✗[/red] {error_msg}")
+        return AssistantResponse(
+            analysis="Review process failed",
+            explanation=error_msg,
+            output="INCORRECT"
+        )
 
 def generate_plan(user_message: str) -> AssistantResponse:
     """Generate implementation plan through streaming API call"""
@@ -478,8 +708,17 @@ def generate_plan(user_message: str) -> AssistantResponse:
             conversation_history[0] = original_system
 
 
-def stream_openai_response(user_message: str):
-    # First, clean up the conversation history while preserving system messages with file content
+def stream_openai_response(user_message: str) -> AssistantResponse:
+    """
+    Generate streaming response from OpenAI with improved file handling.
+    
+    Args:
+        user_message: The user's input message
+        
+    Returns:
+        AssistantResponse object containing the response data
+    """
+    # Clean up conversation history while preserving important context
     system_msgs = [conversation_history[0]]  # Keep initial system prompt
     file_context = []
     user_assistant_pairs = []
@@ -490,11 +729,11 @@ def stream_openai_response(user_message: str):
         elif msg["role"] in ["user", "assistant"]:
             user_assistant_pairs.append(msg)
     
-    # Only keep complete user-assistant pairs
+    # Keep complete user-assistant pairs
     if len(user_assistant_pairs) % 2 != 0:
         user_assistant_pairs = user_assistant_pairs[:-1]
 
-    # Rebuild clean history with files preserved
+    # Rebuild clean history with preserved files
     cleaned_history = system_msgs + file_context
     cleaned_history.extend(user_assistant_pairs)
     cleaned_history.append({"role": "user", "content": user_message})
@@ -503,23 +742,10 @@ def stream_openai_response(user_message: str):
     conversation_history.clear()
     conversation_history.extend(cleaned_history)
 
+    # Handle file references in message
     potential_paths = guess_files_in_message(user_message)
-    valid_files = {}
-
     for path in potential_paths:
-        try:
-            content = read_local_file(path)
-            valid_files[path] = content
-            file_marker = f"Content of file '{path}'"
-            if not any(file_marker in msg["content"] for msg in conversation_history):
-                conversation_history.append({
-                    "role": "system",
-                    "content": f"{file_marker}:\n\n{content}"
-                })
-        except OSError:
-            error_msg = f"File '{path}' does not exist or is not accessible"
-            console.print(f"[red]✗[/red] {error_msg}", style="red")
-            continue
+        ensure_file_in_context(path)
 
     try:
         stream = client.chat.completions.create(
@@ -538,54 +764,61 @@ def stream_openai_response(user_message: str):
                 if not reasoning_started:
                     console.print("\nReasoning:", style="bold yellow")
                     reasoning_started = True
-                console.print(chunk.choices[0].delta.reasoning_content, end="")
-                reasoning_content += chunk.choices[0].delta.reasoning_content
+                reasoning_part = chunk.choices[0].delta.reasoning_content
+                console.print(reasoning_part, end="")
+                reasoning_content += reasoning_part
             elif chunk.choices[0].delta.content:
                 if reasoning_started:
-                    console.print("\n")  # Add spacing after reasoning
+                    console.print("\n")
                     console.print("\nAssistant> ", style="bold blue", end="")
-                    reasoning_started = False  # Reset so we don't add extra spacing
-                final_content += chunk.choices[0].delta.content
-                console.print(chunk.choices[0].delta.content, end="")
+                    reasoning_started = False
+                content_part = chunk.choices[0].delta.content
+                final_content += content_part
+                console.print(content_part, end="")
 
-        console.print()  # New line after streaming
+        console.print()
+
+        # Ensure we have actual content before parsing
+        if not final_content.strip():
+            return AssistantResponse(
+                assistant_reply="No response generated",
+                files_to_create=[],
+                files_to_edit=[]
+            )
 
         try:
+            # Clean up the final content to ensure it's valid JSON
+            final_content = final_content.strip()
+            if not final_content.startswith('{'):
+                final_content = '{' + final_content
+            if not final_content.endswith('}'):
+                final_content = final_content + '}'
+                
             parsed_response = json.loads(final_content)
-
-            # Validate and normalize response structure
-            if isinstance(parsed_response.get("assistant_reply"), dict):
-                parsed_response["assistant_reply"] = json.dumps(parsed_response["assistant_reply"])
             
-            # Ensure required fields exist
-            parsed_response.setdefault("assistant_reply", "")
-            parsed_response.setdefault("files_to_create", [])
-            parsed_response.setdefault("files_to_edit", [])
-
-            # Validate against Pydantic model with safe fallback
-            try:
-                response_obj = AssistantResponse(**parsed_response)
-            except ValueError as e:
-                response_obj = AssistantResponse(
-                    assistant_reply=f"Validation error: {str(e)}",
-                    files_to_create=[],
-                    files_to_edit=[]
+            # Handle review response
+            if "analysis" in parsed_response and "output" in parsed_response:
+                return AssistantResponse(
+                    analysis=parsed_response.get("analysis"),
+                    explanation=parsed_response.get("explanation"),
+                    output=parsed_response.get("output")
                 )
-
-            # Store the complete JSON response in conversation history
-            conversation_history.append({
-                "role": "assistant",
-                "content": final_content  # Store the full JSON response string
-            })
-
-            return response_obj
-
-        except json.JSONDecodeError:
-            error_msg = "Failed to parse JSON response from assistant"
+            
+            # Handle normal response
+            return AssistantResponse(
+                assistant_reply=parsed_response.get("assistant_reply", ""),
+                files_to_create=[FileToCreate(**file) for file in parsed_response.get("files_to_create", [])],
+                files_to_edit=[FileToEdit(**file) for file in parsed_response.get("files_to_edit", [])]
+            )
+            
+        except json.JSONDecodeError as e:
+            error_msg = f"Failed to parse JSON response from assistant: {str(e)}"
             console.print(f"[red]✗[/red] {error_msg}", style="red")
+            console.print(f"Problematic content: {final_content}")
             return AssistantResponse(
                 assistant_reply=error_msg,
-                files_to_create=[]
+                files_to_create=[],
+                files_to_edit=[]
             )
 
     except Exception as e:
@@ -595,6 +828,7 @@ def stream_openai_response(user_message: str):
             assistant_reply=error_msg,
             files_to_create=[]
         )
+    
 
 def trim_conversation_history():
     """Trim conversation history to prevent token limit issues"""
@@ -615,8 +849,8 @@ def trim_conversation_history():
 
 def main():
     console.print(Panel.fit(
-        "[bold blue]Welcome to Deep Seek Engineer with Structured Output[/bold blue] [green](and CoT reasoning)[/green]!🐋",
-        border_style="blue"
+        "[bold red] Initializing Infrared",
+        border_style="red",
     ))
     console.print(
         "Use '[bold magenta]/add[/bold magenta]' to include files in the conversation:\n"
@@ -657,40 +891,95 @@ def main():
         if try_handle_add_command(user_input):
             continue
 
-        # Generate implementation plan
-        console.print("\n[bold yellow]Phase 1: Generating Implementation Plan[/bold yellow]")
-        plan_response = generate_plan(user_input)
-        
-        # Store plan in conversation history
-        if plan_response.assistant_reply:
-            conversation_history.append({
-                "role": "system",
-                "content": json.dumps({
-                    "Message": 'The following is a plan for the implementation of the solution. You are free to use it as a guide if it is helpful.',
-                    "Plan Summary": plan_response.assistant_reply,
-                    "files_to_create": [],
-                    "files_to_edit": []
+        plan_turned_on = False
+        if plan_turned_on:
+            # Generate implementation plan
+            console.print("\n[bold yellow]Phase 1: Generating Implementation Plan[/bold yellow]")
+            plan_response = generate_plan(user_input)
+            
+            # Store plan in conversation history
+            if plan_response.assistant_reply:
+                conversation_history.append({
+                    "role": "system",
+                    "content": json.dumps({
+                        "Message": 'The following is a plan for the implementation of the solution. You are free to use it as a guide if it is helpful.',
+                        "Plan Summary": plan_response.assistant_reply,
+                        "files_to_create": [],
+                        "files_to_edit": []
+                    })
                 })
-            })
+        else:
+            console.print("\n[bold yellow]Phase 1: Planning Skipped [/bold yellow]")
 
         # Generate code implementation
         console.print("\n[bold yellow]Phase 2: Generating Code Implementation[/bold yellow]")
         response_data = stream_openai_response(user_input)
 
-        if response_data.files_to_create:
-            for file_info in response_data.files_to_create:
-                create_file(file_info.path, file_info.content)
+        if response_data:
+            # Display files to create
+            if response_data.files_to_create:
+                console.print("\n[bold cyan]Proposed New Files:[/bold cyan]")
+                for file in response_data.files_to_create:
+                    console.print(Panel.fit(
+                        file.content,
+                        title=f"[bold green]New File: {file.path}[/bold green]",
+                        border_style="green"
+                    ))
 
-        if response_data.files_to_edit:
-            show_diff_table(response_data.files_to_edit)
-            confirm = prompt_session.prompt(
-                "Do you want to apply these changes? (y/n): "
-            ).strip().lower()
-            if confirm == 'y':
+            # Display files to edit
+            if response_data.files_to_edit:
+                console.print("\n[bold cyan]Proposed File Changes:[/bold cyan]")
+                for edit in response_data.files_to_edit:
+                    console.print(Panel.fit(
+                        f"[red]Original:[/red]\n{edit.original_snippet}\n\n[green]New:[/green]\n{edit.new_snippet}",
+                        title=f"[bold yellow]Edit in: {edit.path}[/bold yellow]",
+                        border_style="yellow"
+                    ))
+
+            # If no changes proposed
+            if not response_data.files_to_create and not response_data.files_to_edit:
+                console.print("\n[yellow]No file changes proposed in this implementation.[/yellow]")
+
+        # Phase 3: Automated Code Review
+        console.print("\n[bold yellow]Phase 3: Code Review Analysis[/bold yellow]")
+        review_response = generate_review(response_data)
+
+        # Iterative review handling
+        max_attempts = 3
+        attempt = 1
+        while attempt < max_attempts and review_response.output == "NEED_CHANGES":
+            # Add review feedback to context
+            feedback_content = f"Code Review Feedback (Attempt {attempt}):\nAnalysis: {review_response.analysis}\nExplanation: {review_response.explanation}"
+            conversation_history.append({
+                "role": "system",
+                "content": feedback_content
+            })
+
+            # Regenerate code
+            console.print(f"\n[bold yellow]Attempt {attempt + 1}: Regenerating Code[/bold yellow]")
+            response_data = stream_openai_response(user_input)
+
+            # Review new changes
+            review_response = generate_review(response_data)
+            attempt += 1
+
+        # Final outcome handling
+        if review_response.output == "CORRECT":
+            if response_data.files_to_create:
+                for file_info in response_data.files_to_create:
+                    create_file(file_info.path, file_info.content)
+            if response_data.files_to_edit:
                 for edit_info in response_data.files_to_edit:
                     apply_diff_edit(edit_info.path, edit_info.original_snippet, edit_info.new_snippet)
-            else:
-                console.print("[yellow]ℹ[/yellow] Skipped applying diff edits.", style="yellow")
+            console.print(f"[green]✓[/green] Changes applied after {attempt} attempts")
+        else:
+            console.print(f"[red]✗[/red] Final rejection after {attempt} attempts (Status: {review_response.output or 'NO_STATUS'})")
+            if review_response.analysis or review_response.explanation:
+                console.print(Panel.fit(
+                    f"FINAL ANALYSIS: {review_response.analysis or 'No analysis provided'}\n\nEXPLANATION: {review_response.explanation or 'No explanation provided'}",
+                    title="Review Details",
+                    border_style="red"
+                ))
 
     console.print("[blue]Session finished.[/blue]")
 
