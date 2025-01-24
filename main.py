@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# Welcome to DeepSeek Engineer - Your AI-powered coding assistant! 🚀
 
 import os
 import sys
@@ -114,11 +115,27 @@ system_PROMPT = dedent("""\
 # --------------------------------------------------------------------------------
 
 def read_local_file(file_path: str) -> str:
+    """
+    Reads and returns the content of a local file.
+    
+    Args:
+        file_path (str): Path to the file to read
+    
+    Returns:
+        str: Content of the file as a string
+    """
     """Return the text content of a local file."""
     with open(file_path, "r", encoding="utf-8") as f:
         return f.read()
 
 def create_file(path: str, content: str):
+    """
+    Creates or overwrites a file with the given content.
+    
+    Args:
+        path (str): Path where the file should be created
+        content (str): Content to write to the file
+    """
     """Create (or overwrite) a file at 'path' with the given 'content'."""
     file_path = Path(path)
     file_path.parent.mkdir(parents=True, exist_ok=True)  # ensures any dirs exist
@@ -141,6 +158,12 @@ def create_file(path: str, content: str):
 
 # NEW: Show the user a table of proposed edits and confirm
 def show_diff_table(files_to_edit: List[FileToEdit]) -> None:
+    """
+    Displays a table showing proposed file edits.
+    
+    Args:
+        files_to_edit (List[FileToEdit]): List of file edit proposals
+    """
     if not files_to_edit:
         return
     
@@ -157,6 +180,14 @@ def show_diff_table(files_to_edit: List[FileToEdit]) -> None:
 
 # NEW: Apply diff edits
 def apply_diff_edit(path: str, original_snippet: str, new_snippet: str):
+    """
+    Applies a diff edit to a file by replacing the original snippet with the new one.
+    
+    Args:
+        path (str): Path to the file to edit
+        original_snippet (str): Code to replace
+        new_snippet (str): New code to insert
+    """
     """Reads the file at 'path', replaces the first occurrence of 'original_snippet' with 'new_snippet', then overwrites."""
     try:
         content = read_local_file(path)
@@ -180,6 +211,15 @@ def apply_diff_edit(path: str, original_snippet: str, new_snippet: str):
 
 def try_handle_add_command(user_input: str) -> bool:
     """
+    Handles the /add command to include a file in the conversation.
+    
+    Args:
+        user_input (str): User input to process
+    
+    Returns:
+        bool: True if command was handled, False otherwise
+    """
+    """
     If user_input starts with '/add ', read that file and insert its content
     into conversation as a system message. Returns True if handled; else False.
     """
@@ -200,6 +240,15 @@ def try_handle_add_command(user_input: str) -> bool:
 
 def ensure_file_in_context(file_path: str) -> bool:
     """
+    Ensures a file's content is included in the conversation context.
+    
+    Args:
+        file_path (str): Path to the file to include
+    
+    Returns:
+        bool: True if successful, False if file not found
+    """
+    """
     Ensures the file content is in the conversation context.
     Returns True if successful, False if file not found.
     """
@@ -218,6 +267,15 @@ def ensure_file_in_context(file_path: str) -> bool:
         return False
 
 def normalize_path(path_str: str) -> str:
+    """
+    Converts a path to its canonical, absolute form.
+    
+    Args:
+        path_str (str): Path to normalize
+    
+    Returns:
+        str: Normalized absolute path
+    """
     """Return a canonical, absolute version of the path."""
     return str(Path(path_str).resolve())
 
@@ -233,6 +291,15 @@ conversation_history = [
 # --------------------------------------------------------------------------------
 
 def guess_files_in_message(user_message: str) -> List[str]:
+    """
+    Attempts to identify file paths referenced in a user message.
+    
+    Args:
+        user_message (str): Message to analyze
+    
+    Returns:
+        List[str]: List of potential file paths
+    """
     """
     Attempt to guess which files the user might be referencing.
     Returns normalized absolute paths.
@@ -250,6 +317,15 @@ def guess_files_in_message(user_message: str) -> List[str]:
     return potential_paths
 
 def stream_openai_response(user_message: str):
+    """
+    Streams response from OpenAI API and handles structured output.
+    
+    Args:
+        user_message (str): User's input message
+    
+    Returns:
+        AssistantResponse: Parsed response from the API
+    """
     """
     Streams the DeepSeek chat completion response and handles structured output.
     Returns the final AssistantResponse.
@@ -352,6 +428,10 @@ def stream_openai_response(user_message: str):
 # --------------------------------------------------------------------------------
 
 def main():
+    """
+    Main entry point for the DeepSeek Engineer CLI application.
+    Handles the interactive loop and user input processing.
+    """
     console.print(Panel.fit(
         "[bold blue]Welcome to Deep Seek Engineer with Structured Output[/bold blue] [green](and streaming)[/green]!🐋",
         border_style="blue"

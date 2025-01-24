@@ -51,8 +51,36 @@ class AssistantResponse(BaseModel):
     files_to_edit: Optional[List[FileToEdit]] = None
 
 # --------------------------------------------------------------------------------
-# 3. system prompt
+# 3. system prompts
 # --------------------------------------------------------------------------------
+planning_system_PROMPT = dedent("""\
+    You are an elite software engineer tasked with creating detailed implementation plans.
+    Your job is to analyze user requirements and create a step-by-step plan that will guide the implementation.
+
+    Output Format:
+    Respond STRICTLY in this JSON format:
+    {
+      "assistant_reply": "text string with plan using markdown formatting"
+    }
+
+    Planning Requirements:
+    1. Break down the problem into clear implementation steps
+    2. Identify all affected files and components
+    3. Highlight potential edge cases and error conditions
+    4. Consider security implications and performance impacts
+    5. Outline validation and testing approaches
+    6. Suggest appropriate architectural patterns
+    7. Evaluate alternative solutions if applicable
+    8. Define success criteria for implementation
+
+    Critical Instructions:
+    - assistant_reply MUST be a plain text string
+    - Use '\n' for new lines, NOT actual newlines in JSON
+    - NEVER include other fields like files_to_create/edit
+    - Escape all double quotes in text content
+    - Example valid response: {"assistant_reply": "1. First step\n2. Second step"}
+""")
+
 system_PROMPT = dedent("""\
     You are an elite software engineer called DeepSeek Engineer with decades of experience across all programming domains.
     Your expertise spans system design, algorithms, testing, and best practices.
@@ -78,6 +106,14 @@ system_PROMPT = dedent("""\
           - Make precise changes using diff-based editing
           - Modify specific sections while preserving context
           - Suggest refactoring improvements
+
+    3. Implementation Planning
+       - Create detailed execution plans before writing code
+       - Break down complex problems into sequential steps
+       - Identify affected components and dependencies
+       - Evaluate multiple implementation strategies
+       - Highlight security, performance, and error handling considerations
+       - Outline testing and validation approaches
 
     Output Format:
     You must provide responses in this JSON structure:
@@ -107,12 +143,22 @@ system_PROMPT = dedent("""\
        - Include enough context in original_snippet to locate the change
        - Ensure new_snippet maintains proper indentation
        - Prefer targeted edits over full file replacements
-    5. Always explain your changes and reasoning
+    5. Always begin with a detailed implementation plan in 'assistant_reply' that:
+       - Outlines step-by-step approach to solve the problem
+       - Identifies relevant files and components involved
+       - Addresses potential edge cases and error conditions
+       - Considers security and performance implications
+       - Proposes testing and validation strategy
+    6. Always explain your changes and reasoning
     6. Consider edge cases and potential impacts
     7. Follow language-specific best practices
     8. Suggest tests or validation steps when appropriate
 
     Remember: You're a senior engineer - be thorough, precise, and thoughtful in your solutions.
+
+    Technical Reference:
+    - Always consult and strictly adhere to the technical stack documentation in tech_stack.md
+    - Validate all implementations against version requirements in tech_stack.md
 """)
 
 # --------------------------------------------------------------------------------
@@ -376,7 +422,7 @@ conversation_history = [
 # --------------------------------------------------------------------------------
 
 def guess_files_in_message(user_message: str) -> List[str]:
-    recognized_extensions = [".css", ".html", ".js", ".py", ".json", ".md"]
+    recognized_extensions = [".css", ".html", ".js", ".py", ".json", ".md", ".txt", ".yml", ".yaml", ".ts", ".tsx"]
     potential_paths = []
     for word in user_message.split():
         if any(ext in word for ext in recognized_extensions) or "/" in word:
@@ -387,6 +433,50 @@ def guess_files_in_message(user_message: str) -> List[str]:
             except (OSError, ValueError):
                 continue
     return potential_paths
+
+def generate_plan(user_message: str) -> AssistantResponse:
+    """Generate implementation plan through streaming API call"""
+    console.print("\n[bold yellow]Starting Planning Phase[/bold yellow]")
+    
+    # Save original conversation state
+    original_history = conversation_history.copy()
+    original_system = original_history[0] if original_history else None
+    
+    try:
+        # Create temporary planning context
+        planning_history = [
+            {"role": "system", "content": planning_system_PROMPT},
+            *[msg for msg in original_history if msg["role"] == "system" and "Content of file '" in msg["content"]],
+        ]
+        
+        # Replace global conversation history with planning version
+        conversation_history.clear()
+        conversation_history.extend(planning_history)
+        
+        # Generate response using streaming
+        console.print("[cyan]Streaming planning thoughts...[/cyan]")
+        response = stream_openai_response(user_message)
+        
+        # Log plan generation
+        console.print(f"\n[green]✓[/green] Planning phase completed")
+        if response.assistant_reply:
+            console.print(Panel.fit(
+                response.assistant_reply,
+                title="Implementation Plan",
+                border_style="blue"
+            ))
+        
+        return response
+    except Exception as e:
+        console.print(f"[red]✗[/red] Planning Error: {str(e)}", style="red")
+        return AssistantResponse(assistant_reply=f"⚠ Planning Error: {str(e)}")
+    finally:
+        # Restore original conversation history
+        conversation_history.clear()
+        conversation_history.extend(original_history)
+        if original_system:
+            conversation_history[0] = original_system
+
 
 def stream_openai_response(user_message: str):
     # First, clean up the conversation history while preserving system messages with file content
@@ -427,7 +517,7 @@ def stream_openai_response(user_message: str):
                     "content": f"{file_marker}:\n\n{content}"
                 })
         except OSError:
-            error_msg = f"Cannot proceed: File '{path}' does not exist or is not accessible"
+            error_msg = f"File '{path}' does not exist or is not accessible"
             console.print(f"[red]✗[/red] {error_msg}", style="red")
             continue
 
@@ -435,7 +525,6 @@ def stream_openai_response(user_message: str):
         stream = client.chat.completions.create(
             model="deepseek-reasoner",
             messages=conversation_history,
-            max_completion_tokens=8000,
             stream=True
         )
 
@@ -463,24 +552,25 @@ def stream_openai_response(user_message: str):
 
         try:
             parsed_response = json.loads(final_content)
+
+            # Validate and normalize response structure
+            if isinstance(parsed_response.get("assistant_reply"), dict):
+                parsed_response["assistant_reply"] = json.dumps(parsed_response["assistant_reply"])
             
-            if "assistant_reply" not in parsed_response:
-                parsed_response["assistant_reply"] = ""
+            # Ensure required fields exist
+            parsed_response.setdefault("assistant_reply", "")
+            parsed_response.setdefault("files_to_create", [])
+            parsed_response.setdefault("files_to_edit", [])
 
-            if "files_to_edit" in parsed_response and parsed_response["files_to_edit"]:
-                new_files_to_edit = []
-                for edit in parsed_response["files_to_edit"]:
-                    try:
-                        edit_abs_path = normalize_path(edit["path"])
-                        if edit_abs_path in valid_files or ensure_file_in_context(edit_abs_path):
-                            edit["path"] = edit_abs_path
-                            new_files_to_edit.append(edit)
-                    except (OSError, ValueError):
-                        console.print(f"[yellow]⚠[/yellow] Skipping invalid path: '{edit['path']}'", style="yellow")
-                        continue
-                parsed_response["files_to_edit"] = new_files_to_edit
-
-            response_obj = AssistantResponse(**parsed_response)
+            # Validate against Pydantic model with safe fallback
+            try:
+                response_obj = AssistantResponse(**parsed_response)
+            except ValueError as e:
+                response_obj = AssistantResponse(
+                    assistant_reply=f"Validation error: {str(e)}",
+                    files_to_create=[],
+                    files_to_edit=[]
+                )
 
             # Store the complete JSON response in conversation history
             conversation_history.append({
@@ -536,6 +626,20 @@ def main():
         "Type '[bold red]exit[/bold red]' or '[bold red]quit[/bold red]' to end.\n"
     )
 
+    # Load technical stack documentation
+    tech_stack_path = "tech_stack.md"
+    try:
+        content = read_local_file(tech_stack_path)
+        conversation_history.append({
+            "role": "system",
+            "content": f"Content of file 'tech_stack.md':\n\n{content}"
+        })
+        console.print(f"[green]✓[/green] Loaded technical stack documentation from '[cyan]{tech_stack_path}[/cyan]'")
+    except FileNotFoundError:
+        console.print(f"[red]✗[/red] Critical error: [cyan]{tech_stack_path}[/cyan] not found. Technical guidelines unavailable.")
+    except Exception as e:
+        console.print(f"[red]✗[/red] Error loading technical stack: {str(e)}")
+
     while True:
         try:
             user_input = prompt_session.prompt("You> ").strip()
@@ -553,6 +657,24 @@ def main():
         if try_handle_add_command(user_input):
             continue
 
+        # Generate implementation plan
+        console.print("\n[bold yellow]Phase 1: Generating Implementation Plan[/bold yellow]")
+        plan_response = generate_plan(user_input)
+        
+        # Store plan in conversation history
+        if plan_response.assistant_reply:
+            conversation_history.append({
+                "role": "system",
+                "content": json.dumps({
+                    "Message": 'The following is a plan for the implementation of the solution. You are free to use it as a guide if it is helpful.',
+                    "Plan Summary": plan_response.assistant_reply,
+                    "files_to_create": [],
+                    "files_to_edit": []
+                })
+            })
+
+        # Generate code implementation
+        console.print("\n[bold yellow]Phase 2: Generating Code Implementation[/bold yellow]")
         response_data = stream_openai_response(user_input)
 
         if response_data.files_to_create:
