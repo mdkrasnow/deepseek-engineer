@@ -28,10 +28,19 @@ prompt_session = PromptSession(
 # 1. Configure OpenAI client and load environment variables
 # --------------------------------------------------------------------------------
 load_dotenv()  # Load environment variables from .env file
-client = OpenAI(
-    api_key=os.getenv("DEEPSEEK_API_KEY"),
-    base_url="https://api.deepseek.com"
-)  # Configure for DeepSeek API
+
+
+deepseek = False
+if deepseek:
+    client = OpenAI(
+        api_key=os.getenv("DEEPSEEK_API_KEY"),
+        base_url="https://api.deepseek.com"
+    )  # Configure for DeepSeek API
+    model = 'deepseek-reasoner'
+else:
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    model = 'o1-mini'
+
 
 # --------------------------------------------------------------------------------
 # 2. Define our schema using Pydantic for type safety
@@ -54,9 +63,9 @@ class AssistantResponse(BaseModel):
     output: Optional[str] = Field(None, pattern=r'^(CORRECT|INCORRECT|UNECESSARY|NEED_CHANGES)$')
 
 # --------------------------------------------------------------------------------
-# 3. system prompts
+# 3. user prompts
 # --------------------------------------------------------------------------------
-planning_system_PROMPT = dedent("""\
+planning_user_PROMPT = dedent("""\
     You are an elite software engineer tasked with creating detailed implementation plans.
     Your job is to analyze user requirements and create a step-by-step plan that will guide the implementation.
 
@@ -84,7 +93,7 @@ planning_system_PROMPT = dedent("""\
     - Example valid response: {"assistant_reply": "1. First step\n2. Second step"}
 """)
 
-review_system_PROMPT = dedent("""\
+review_user_PROMPT = dedent("""\
     You are an elite software engineer tasked with reviewing code changes.
     Your job is to analyze proposed code changes and determine if they correctly and completely solve the problem while adhering to all guidelines.
 
@@ -106,7 +115,7 @@ review_system_PROMPT = dedent("""\
     This format allows the review function to make accurate determinations about whether the changes should be marked as CORRECT, INCORRECT, UNNECESSARY, or NEED_CHANGES based on a clear view of exactly what is being modified.
 
     Review Requirements:
-    1. State which change you are reviewing from previous system input.
+    1. State which change you are reviewing from previous user input.
     2. Analyze each of the diffs provided in 'changes'
     3. Evaluate them based on the review criteria
     4. Provide a detailed analysis of the changes
@@ -150,9 +159,9 @@ review_system_PROMPT = dedent("""\
     - Escape all double quotes in text content
 """)
 
-system_PROMPT = dedent("""\
+user_PROMPT = dedent("""\
     You are an elite software engineer called DeepSeek Engineer with decades of experience across all programming domains.
-    Your expertise spans system design, algorithms, testing, and best practices.
+    Your expertise spans user design, algorithms, testing, and best practices.
     You provide thoughtful, well-structured solutions while explaining your reasoning.
 
     Core capabilities:
@@ -257,15 +266,15 @@ def create_file(path: str, content: str):
         f.write(content)
     console.print(f"[green]✓[/green] Created/updated file at '[cyan]{file_path}[/cyan]'")
     
-    # Record the action as a system message
+    # Record the action as a user message
     conversation_history.append({
-        "role": "system",
+        "role": "user",
         "content": f"File operation: Created/updated file at '{file_path}'"
     })
     
     normalized_path = normalize_path(str(file_path))
     conversation_history.append({
-        "role": "system",
+        "role": "user",
         "content": f"Content of file '{normalized_path}':\n\n{content}"
     })
 
@@ -300,9 +309,9 @@ def apply_diff_edit(path: str, original_snippet: str, new_snippet: str):
         updated_content = content.replace(original_snippet, new_snippet, 1)
         create_file(path, updated_content)
         console.print(f"[green]✓[/green] Applied diff edit to '[cyan]{path}[/cyan]'")
-        # Record the edit as a system message
+        # Record the edit as a user message
         conversation_history.append({
-            "role": "system",
+            "role": "user",
             "content": f"File operation: Applied diff edit to '{path}'"
         })
     except FileNotFoundError:
@@ -327,7 +336,7 @@ def try_handle_add_command(user_input: str) -> bool:
                 # Handle a single file as before
                 content = read_local_file(normalized_path)
                 conversation_history.append({
-                    "role": "system",
+                    "role": "user",
                     "content": f"Content of file '{normalized_path}':\n\n{content}"
                 })
                 console.print(f"[green]✓[/green] Added file '[cyan]{normalized_path}[/cyan]' to conversation.\n")
@@ -351,7 +360,7 @@ def get_file_content_from_history(file_path: str, conversation_history: List[Dic
     file_marker = f"Content of file '{normalized_path}'"
     
     for msg in conversation_history:
-        if msg["role"] == "system" and file_marker in msg["content"]:
+        if msg["role"] == "user" and file_marker in msg["content"]:
             # Extract content after the marker
             content = msg["content"].split(file_marker + ":\n\n", 1)
             if len(content) > 1:
@@ -449,7 +458,7 @@ def ensure_file_in_context(file_path: str) -> bool:
         # If not found, try to read and add
         content = read_local_file(normalized_path)
         conversation_history.append({
-            "role": "system",
+            "role": "user",
             "content": f"Content of file '{normalized_path}':\n\n{content}"
         })
         return True
@@ -472,7 +481,7 @@ def normalize_path(path_str: str) -> str:
 # 5. Conversation state
 # --------------------------------------------------------------------------------
 conversation_history = [
-    {"role": "system", "content": system_PROMPT}
+    {"role": "user", "content": user_PROMPT}
 ]
 
 # --------------------------------------------------------------------------------
@@ -541,13 +550,13 @@ def generate_review(response_data: AssistantResponse) -> AssistantResponse:
         
         # Process file contents from conversation history
         for msg in conversation_history:
-            if msg["role"] == "system" and "Content of file '" in msg["content"]:
+            if msg["role"] == "user" and "Content of file '" in msg["content"]:
                 file_contexts.append(msg["content"])
                 
         # Process implementation plan if it exists
         plan_context = []
         for msg in conversation_history:
-            if msg["role"] == "system" and '"Plan Summary"' in msg["content"]:
+            if msg["role"] == "user" and '"Plan Summary"' in msg["content"]:
                 try:
                     plan_data = json.loads(msg["content"])
                     plan_context.append(f"Implementation Plan:\n{plan_data.get('Plan Summary', 'No plan found')}")
@@ -579,7 +588,7 @@ def generate_review(response_data: AssistantResponse) -> AssistantResponse:
             "content": dedent(f"""
                 You are an elite software engineer performing a code review. Here is the complete context and changes to review:
 
-                {review_system_PROMPT}
+                {review_user_PROMPT}
 
                 EXISTING FILE CONTEXT:
                 {''.join(file_contexts)}
@@ -607,13 +616,13 @@ def generate_review(response_data: AssistantResponse) -> AssistantResponse:
         # Generate review using streaming
         console.print("[cyan]Analyzing code changes...[/cyan]")
         review_messages = [
-            {"role": "system", "content": review_system_PROMPT},
+            {"role": "user", "content": review_user_PROMPT},
             review_request
         ]
         
         # Create a new chat completion for review
         stream = client.chat.completions.create(
-            model="deepseek-reasoner",
+            model=model,
             messages=review_messages,
             stream=True
         )
@@ -670,13 +679,13 @@ def generate_plan(user_message: str) -> AssistantResponse:
     
     # Save original conversation state
     original_history = conversation_history.copy()
-    original_system = original_history[0] if original_history else None
+    original_user = original_history[0] if original_history else None
     
     try:
         # Create temporary planning context
         planning_history = [
-            {"role": "system", "content": planning_system_PROMPT},
-            *[msg for msg in original_history if msg["role"] == "system" and "Content of file '" in msg["content"]],
+            {"role": "user", "content": planning_user_PROMPT},
+            *[msg for msg in original_history if msg["role"] == "user" and "Content of file '" in msg["content"]],
         ]
         
         # Replace global conversation history with planning version
@@ -704,8 +713,8 @@ def generate_plan(user_message: str) -> AssistantResponse:
         # Restore original conversation history
         conversation_history.clear()
         conversation_history.extend(original_history)
-        if original_system:
-            conversation_history[0] = original_system
+        if original_user:
+            conversation_history[0] = original_user
 
 
 def stream_openai_response(user_message: str) -> AssistantResponse:
@@ -719,12 +728,12 @@ def stream_openai_response(user_message: str) -> AssistantResponse:
         AssistantResponse object containing the response data
     """
     # Clean up conversation history while preserving important context
-    system_msgs = [conversation_history[0]]  # Keep initial system prompt
+    user_msgs = [conversation_history[0]]  # Keep initial user prompt
     file_context = []
     user_assistant_pairs = []
     
     for msg in conversation_history[1:]:
-        if msg["role"] == "system" and "Content of file '" in msg["content"]:
+        if msg["role"] == "user" and "Content of file '" in msg["content"]:
             file_context.append(msg)
         elif msg["role"] in ["user", "assistant"]:
             user_assistant_pairs.append(msg)
@@ -734,7 +743,7 @@ def stream_openai_response(user_message: str) -> AssistantResponse:
         user_assistant_pairs = user_assistant_pairs[:-1]
 
     # Rebuild clean history with preserved files
-    cleaned_history = system_msgs + file_context
+    cleaned_history = user_msgs + file_context
     cleaned_history.extend(user_assistant_pairs)
     cleaned_history.append({"role": "user", "content": user_message})
     
@@ -749,7 +758,7 @@ def stream_openai_response(user_message: str) -> AssistantResponse:
 
     try:
         stream = client.chat.completions.create(
-            model="deepseek-reasoner",
+            model=model,
             messages=conversation_history,
             stream=True
         )
@@ -759,24 +768,30 @@ def stream_openai_response(user_message: str) -> AssistantResponse:
         reasoning_content = ""
         final_content = ""
 
-        for chunk in stream:
-            if chunk.choices[0].delta.reasoning_content:
-                if not reasoning_started:
-                    console.print("\nReasoning:", style="bold yellow")
-                    reasoning_started = True
-                reasoning_part = chunk.choices[0].delta.reasoning_content
-                console.print(reasoning_part, end="")
-                reasoning_content += reasoning_part
-            elif chunk.choices[0].delta.content:
-                if reasoning_started:
-                    console.print("\n")
-                    console.print("\nAssistant> ", style="bold blue", end="")
-                    reasoning_started = False
-                content_part = chunk.choices[0].delta.content
-                final_content += content_part
-                console.print(content_part, end="")
+        if deepseek:
 
-        console.print()
+            for chunk in stream:
+                if chunk.choices[0].delta.reasoning_content:
+                    if not reasoning_started:
+                        console.print("\nReasoning:", style="bold yellow")
+                        reasoning_started = True
+                    reasoning_part = chunk.choices[0].delta.reasoning_content
+                    console.print(reasoning_part, end="")
+                    reasoning_content += reasoning_part
+                elif chunk.choices[0].delta.content:
+                    if reasoning_started:
+                        console.print("\n")
+                        console.print("\nAssistant> ", style="bold blue", end="")
+                        reasoning_started = False
+                    content_part = chunk.choices[0].delta.content
+                    final_content += content_part
+                    console.print(content_part, end="")
+
+        else:
+            for chunk in stream:
+                if chunk.choices[0].delta.content is not None:
+                    print(chunk.choices[0].delta.content, end="")
+                    console.print()
 
         # Ensure we have actual content before parsing
         if not final_content.strip():
@@ -833,15 +848,15 @@ def stream_openai_response(user_message: str) -> AssistantResponse:
 def trim_conversation_history():
     """Trim conversation history to prevent token limit issues"""
     max_pairs = 10  # Adjust based on your needs
-    system_msgs = [msg for msg in conversation_history if msg["role"] == "system"]
-    other_msgs = [msg for msg in conversation_history if msg["role"] != "system"]
+    user_msgs = [msg for msg in conversation_history if msg["role"] == "user"]
+    other_msgs = [msg for msg in conversation_history if msg["role"] != "user"]
     
     # Keep only the last max_pairs of user-assistant interactions
     if len(other_msgs) > max_pairs * 2:
         other_msgs = other_msgs[-max_pairs * 2:]
     
     conversation_history.clear()
-    conversation_history.extend(system_msgs + other_msgs)
+    conversation_history.extend(user_msgs + other_msgs)
 
 # --------------------------------------------------------------------------------
 # 7. Main interactive loop
@@ -865,7 +880,7 @@ def main():
     try:
         content = read_local_file(tech_stack_path)
         conversation_history.append({
-            "role": "system",
+            "role": "user",
             "content": f"Content of file 'tech_stack.md':\n\n{content}"
         })
         console.print(f"[green]✓[/green] Loaded technical stack documentation from '[cyan]{tech_stack_path}[/cyan]'")
@@ -900,7 +915,7 @@ def main():
             # Store plan in conversation history
             if plan_response.assistant_reply:
                 conversation_history.append({
-                    "role": "system",
+                    "role": "user",
                     "content": json.dumps({
                         "Message": 'The following is a plan for the implementation of the solution. You are free to use it as a guide if it is helpful.',
                         "Plan Summary": plan_response.assistant_reply,
@@ -951,7 +966,7 @@ def main():
             # Add review feedback to context
             feedback_content = f"Code Review Feedback (Attempt {attempt}):\nAnalysis: {review_response.analysis}\nExplanation: {review_response.explanation}"
             conversation_history.append({
-                "role": "system",
+                "role": "user",
                 "content": feedback_content
             })
 
